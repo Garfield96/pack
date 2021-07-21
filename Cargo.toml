@@ -1,0 +1,19 @@
+[package]
+name = "pack"
+version = "0.1.0"
+authors = ["Christian Menges <christian.menges@tum.de>"]
+edition = "2018"
+
+[dependencies]
+debpkg = "0.5.0"
+clap = "3.0.0-beta.2"
+debcontrol = "0.1.1"
+rusqlite = {version="0.25.3", features = ["blob", "functions"]}
+postgres = "0.19.1"
+tar = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+tempfile = "3"
+log = "0.4"
+env_logger = "0.8.4"
+sha2 = "0.9.5"
+flate2 = "1.0"
