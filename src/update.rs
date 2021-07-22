@@ -7,7 +7,7 @@ use std::io::Cursor;
 use tempfile::NamedTempFile;
 
 pub fn update(db_name: &str) {
-    let filename = "dists/bullseye/main/binary-all/Packages.gz";
+    let filename = "dists/bullseye/main/binary-amd64/Packages.gz";
     // Download metadata
     let url = Url::parse(MIRROR).unwrap().join(filename).unwrap();
     let p = reqwest::blocking::get(url).unwrap();
@@ -18,7 +18,10 @@ pub fn update(db_name: &str) {
     let mut conn = SQLite::init(db_name);
     let tx = conn.transaction().unwrap();
     // Drop old data
-    tx.execute("DELETE FROM status_available", []).unwrap();
+    tx.execute("DROP TABLE IF EXISTS status_available", [])
+        .unwrap();
+    tx.execute("DROP TABLE IF EXISTS dependencies_available", [])
+        .unwrap();
     tx.commit().unwrap();
 
     // Unpack data

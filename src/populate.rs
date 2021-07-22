@@ -35,7 +35,7 @@ pub fn populate_db_auto_installed(db_name: &str, file: String) {
     tx.commit().unwrap();
 }
 
-fn setup_db(db_name: &str, suffix: &str) {
+pub fn setup_db(db_name: &str, suffix: &str) {
     let mut conn = SQLite::init(db_name);
     let tx = conn.transaction().unwrap();
     tx.execute(
@@ -93,6 +93,7 @@ fn setup_db(db_name: &str, suffix: &str) {
             package TEXT NOT NULL,\
             type TEXT NOT NULL,\
             dependency TEXT NOT NULL,\
+            version_cmp TEXT,\
             version TEXT,\
             FOREIGN KEY(package) REFERENCES status(package{0})
             )",
@@ -130,8 +131,6 @@ fn setup_db(db_name: &str, suffix: &str) {
 }
 
 pub fn populate_db(db_name: &str, file: &Path, suffix: &str) {
-    setup_db(db_name, suffix);
-
     let mut conn = SQLite::init(db_name);
     let status_file = File::open(file).unwrap();
     let mut buf_parse = BufParse::new(status_file, 4096);
@@ -168,8 +167,12 @@ pub fn populate_db(db_name: &str, file: &Path, suffix: &str) {
                     package, \
                     type, \
                     dependency, \
+                    version_cmp,\
                     version) \
-                    VALUES (?1, ?2, ?3, ?4)",
+                    VALUES (?1, ?2, ?3, \
+                    (SELECT substr(?4, 0, INSTR(?4, ' '))), \
+                    (SELECT trim(substr(?4, INSTR(?4, ' ')))) \
+                    )",
             suffix
         ))
         .unwrap();

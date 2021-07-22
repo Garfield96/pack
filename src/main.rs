@@ -10,7 +10,7 @@ mod utils;
 use crate::autoremove::autoremove;
 use crate::extract::extract_archive;
 use crate::install::install;
-use crate::populate::{populate_db, populate_db_auto_installed};
+use crate::populate::{populate_db, populate_db_auto_installed, setup_db};
 use crate::purge::purge;
 use crate::update::update;
 use clap::Clap;
@@ -110,6 +110,7 @@ fn main() {
                 populate_db_auto_installed(db_name, p.status_file)
             } else {
                 let suffix = if p.available { "_available" } else { "" };
+                setup_db(db_name, suffix);
                 populate_db(db_name, Path::new(&p.status_file), suffix);
             }
         }

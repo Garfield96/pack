@@ -1,23 +1,24 @@
 use crate::db_backend::SQLite;
-use crate::populate::populate_db;
+use crate::populate::{populate_db, setup_db};
 use crate::utils::execute_script;
 use crate::MIRROR;
 use debpkg::DebPkg;
 use log::warn;
 use reqwest::Url;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::{Arc, RwLock};
+use std::thread;
 use tar::EntryType;
 use tempfile::{tempdir, NamedTempFile};
 
-fn get_package(db_name: &str, package: &str) -> Result<DebPkg<File>, std::io::ErrorKind> {
+fn get_package(package: &str, conn: &mut Connection) -> Result<DebPkg<File>, std::io::ErrorKind> {
     if package.ends_with(".deb") {
         let source = File::open(package).expect("File not found");
         Ok(DebPkg::parse(source).expect("Parsing failed"))
     } else {
-        let mut conn = SQLite::init(db_name);
         let tx = conn.transaction().unwrap();
         let (filename, _expected_md5, expected_sha256) = tx
             .query_row(
@@ -33,13 +34,13 @@ fn get_package(db_name: &str, package: &str) -> Result<DebPkg<File>, std::io::Er
             )
             .unwrap();
         tx.commit().unwrap();
-        conn.close();
 
         if filename.is_err() {
             warn!("{}", filename.unwrap_err());
             return Err(std::io::ErrorKind::NotFound);
         }
 
+        println!("Download {}", package);
         let url = Url::parse(MIRROR)
             .unwrap()
             .join(&filename.unwrap())
@@ -61,9 +62,12 @@ fn get_package(db_name: &str, package: &str) -> Result<DebPkg<File>, std::io::Er
             .iter()
             .for_each(|c| hash_str.push_str(&*format!("{:02x}", c)));
         if hash_str == expected_sha256.unwrap() {
-            println!("Hashes match");
+            println!("{}: Hashes match", package);
         } else {
-            panic!("The hash value of the downloaded package is different. Abort");
+            panic!(
+                "The hash value of the downloaded package {} is different. Abort",
+                package
+            );
         }
 
         let mut writer = NamedTempFile::new().unwrap();
@@ -75,29 +79,37 @@ fn get_package(db_name: &str, package: &str) -> Result<DebPkg<File>, std::io::Er
     }
 }
 
-pub fn install(db_name: &str, package_name: String, automatic_install: bool) {
+struct State {
+    rwlock: RwLock<i32>,
+}
+
+fn install_impl(db_name: &str, package_name: String, automatic_install: bool, state: Arc<State>) {
     let mut conn = SQLite::init(db_name);
 
-    // Check whether package is already installed
-    let mut installed_stmt = conn
-        .prepare("SELECT count(*) FROM status WHERE package = ?1".to_string())
-        .unwrap();
+    if !automatic_install {
+        // Check whether package is already installed
+        let mut installed_stmt = conn
+            .prepare("SELECT count(*) FROM status WHERE package = ?1".to_string())
+            .unwrap();
 
-    let installed = installed_stmt
-        .query_row(params![package_name.trim()], |r| r.get::<_, u64>(0))
-        .unwrap();
+        let installed = installed_stmt
+            .query_row(params![package_name.trim()], |r| r.get::<_, u64>(0))
+            .unwrap();
 
-    installed_stmt.finalize().unwrap();
+        installed_stmt.finalize().unwrap();
 
-    if installed > 0 {
-        println!("Package {} already installed", package_name);
-        return;
+        if installed > 0 {
+            println!("Package {} already installed", package_name);
+            return;
+        }
+        setup_db(db_name, "_temp");
     }
 
-    let package = get_package(db_name, package_name.as_str());
+    let package = get_package(package_name.as_str(), &mut conn.conn.as_mut().unwrap());
     if package.is_err() {
         return;
     }
+
     let mut package = package.unwrap();
     let control_dir = tempdir().unwrap();
     package
@@ -117,22 +129,23 @@ pub fn install(db_name: &str, package_name: String, automatic_install: bool) {
         let mut get_depends_stmt = conn
             .prepare(
                 "WITH RECURSIVE deps as (
-                    SELECT TRIM(dependency) as dependency
+                    SELECT TRIM(dependency) as dependency, version_cmp, version
                     FROM dependencies_temp
                     WHERE type = 'depends'
                     UNION
-                    SELECT TRIM(d.dependency) as dependency
+                    SELECT TRIM(d.dependency) as dependency, d.version_cmp, d.version
                     FROM dependencies_available as d, deps as dr
                     WHERE TRIM(d.package) = dr.dependency AND
-                          d.type = 'depends'
+                          (d.type = 'depends' OR d.type = 'pre-depends')
                 )
-                SELECT DISTINCT *
+                SELECT DISTINCT d.dependency
                 FROM deps as d
-                WHERE NOT EXISTS (SELECT * FROM status as s WHERE TRIM(s.package) = d.dependency);"
+                WHERE
+                    NOT EXISTS (SELECT * FROM status as s WHERE TRIM(s.package) = d.dependency) AND
+                    NOT EXISTS (SELECT * FROM dependencies as di WHERE di.type = 'provides' AND d.dependency = di.dependency)"
                     .to_string(),
             )
             .unwrap();
-
         let deps: Vec<String> = get_depends_stmt
             .query_map(params![], |p| p.get::<_, String>(0))
             .unwrap()
@@ -141,62 +154,72 @@ pub fn install(db_name: &str, package_name: String, automatic_install: bool) {
 
         get_depends_stmt.finalize().unwrap();
 
+        let mut threads = vec![];
         for d in deps {
-            println!("{}", d);
-            install(db_name, d, true);
+            let state_ref = Arc::clone(&state);
+            threads.push(thread::spawn(move || {
+                println!("Install {}", d);
+                install_impl("packages.db", d, true, state_ref);
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
         }
     }
 
     let tx = conn.transaction().unwrap();
 
-    // Install dependencies and package in topological order
+    {
+        let _lock = state.rwlock.write();
+        // Install dependencies and package in topological order
 
-    // Run pre-install script
-    let pre_install_script = control_dir.path().join("preinst");
-    if pre_install_script.exists() {
-        execute_script("pre-install", pre_install_script.as_path()).unwrap();
-    }
-
-    let mut file_stmt = tx
-        .prepare("INSERT INTO installed_files (package, file) VALUES (?1, ?2)")
-        .unwrap();
-
-    // Copy files
-    ////////////////////////////////////////////////////////////////////////////////////////////////
-    // adapted from tar/src/archive.rs
-
-    // Delay any directory entries until the end (they will be created if needed by
-    // descendants), to ensure that directory permissions do not interfer with descendant
-    // extraction.
-    let mut directories = Vec::new();
-    let mut data = package.data().unwrap();
-    for entry in data.entries().unwrap() {
-        let mut file = entry.unwrap();
-        if file.header().entry_type() == EntryType::Directory {
-            directories.push(file);
-        } else {
-            file_stmt
-                .execute(params![
-                    package_name,
-                    file.path().unwrap().to_str().unwrap()
-                ])
-                .unwrap();
-            file.unpack_in("/").unwrap();
+        // Run pre-install script
+        let pre_install_script = control_dir.path().join("preinst");
+        if pre_install_script.exists() {
+            execute_script("pre-install", pre_install_script.as_path()).unwrap();
         }
-    }
-    for mut dir in directories {
-        dir.unpack_in("/").unwrap();
-    }
 
-    // end from archive.rs
-    ////////////////////////////////////////////////////////////////////////////////////////////////
+        let mut file_stmt = tx
+            .prepare("INSERT INTO installed_files (package, file) VALUES (?1, ?2)")
+            .unwrap();
 
-    file_stmt.finalize().unwrap();
+        // Copy files
+        ////////////////////////////////////////////////////////////////////////////////////////////////
+        // adapted from tar/src/archive.rs
 
-    // Run post-install script
-    let post_install_script = control_dir.path().join("postinst");
-    if post_install_script.exists() {
-        execute_script("post-install", post_install_script.as_path()).unwrap();
+        // Delay any directory entries until the end (they will be created if needed by
+        // descendants), to ensure that directory permissions do not interfer with descendant
+        // extraction.
+        let mut directories = Vec::new();
+        let mut data = package.data().unwrap();
+        for entry in data.entries().unwrap() {
+            let mut file = entry.unwrap();
+            if file.header().entry_type() == EntryType::Directory {
+                directories.push(file);
+            } else {
+                file_stmt
+                    .execute(params![
+                        package_name,
+                        file.path().unwrap().to_str().unwrap()
+                    ])
+                    .unwrap();
+                file.unpack_in("/").unwrap();
+            }
+        }
+        for mut dir in directories {
+            dir.unpack_in("/").unwrap();
+        }
+
+        // end from archive.rs
+        ////////////////////////////////////////////////////////////////////////////////////////////////
+
+        file_stmt.finalize().unwrap();
+
+        // Run post-install script
+        let post_install_script = control_dir.path().join("postinst");
+        if post_install_script.exists() {
+            execute_script("post-install", post_install_script.as_path()).unwrap();
+        }
     }
 
     // Store pre- and post-remove scripts
@@ -242,4 +265,12 @@ pub fn install(db_name: &str, package_name: String, automatic_install: bool) {
     }
 
     tx.commit().unwrap();
+}
+
+pub fn install(db_name: &str, package_name: String, automatic_install: bool) {
+    let state = State {
+        rwlock: RwLock::new(1),
+    };
+    let arc = Arc::new(state);
+    install_impl(db_name, package_name, automatic_install, arc);
 }

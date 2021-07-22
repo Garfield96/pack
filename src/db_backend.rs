@@ -1,6 +1,7 @@
 use postgres::Error;
 use rusqlite::{Connection, Statement, Transaction};
 
+use crate::utils::add_version_compare;
 use std::fmt;
 
 // pub(crate) trait DB {
@@ -16,9 +17,11 @@ pub struct SQLite {
 // impl DB for SQLite {
 impl SQLite {
     pub fn init(db_name: &str) -> SQLite {
-        SQLite {
+        let r = SQLite {
             conn: Some(Connection::open(db_name).unwrap()),
-        }
+        };
+        add_version_compare(r.conn.as_ref().unwrap()).unwrap();
+        r
     }
 
     pub fn close(&mut self) {
