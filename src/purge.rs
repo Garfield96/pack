@@ -21,15 +21,18 @@ pub fn purge(db_name: &str, package: &str) {
         )
         .unwrap();
 
-    let (dep_count, prerm, postrm) = get_info_stmt
-        .query_row(params![package], |e| {
-            Ok((
-                e.get::<_, u64>(0).unwrap(),
-                e.get::<_, String>(1).unwrap(),
-                e.get::<_, String>(2).unwrap(),
-            ))
-        })
-        .unwrap();
+    let query_result = get_info_stmt.query_row(params![package], |e| {
+        Ok((
+            e.get::<_, u64>(0).unwrap(),
+            e.get::<_, String>(1).unwrap(),
+            e.get::<_, String>(2).unwrap(),
+        ))
+    });
+    if query_result.is_err() {
+        println!("{} is not installed", package);
+        return;
+    }
+    let (dep_count, prerm, postrm) = query_result.unwrap();
     get_info_stmt.finalize().unwrap();
 
     // is this package is a dependency, it is marked as automatically installed
